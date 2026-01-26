@@ -8,6 +8,9 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# Modified for SOGS (Second-Order Gaussian Splatting)
+# Based on paper: "SOGS: Second-Order Anchor for Advanced 3D Gaussian Splatting"
+#
 
 import torch
 from functools import reduce
@@ -57,6 +60,9 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 # SOGS parameters
+                 use_second_order : bool = True,
+                 num_eigenvectors : int = 2,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +79,12 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        
+        # SOGS: Second-Order Anchor parameters
+        self.use_second_order = use_second_order
+        self.num_eigenvectors = num_eigenvectors  # M in the paper
+        self.top_eigenvectors = None  # Will store [D, M] eigenvectors
+        self._second_order_computed = False
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -103,9 +115,25 @@ class GaussianModel:
                 nn.Softmax(dim=1)
             ).cuda()
 
+        # SOGS: Feature augmentation MLPs for second-order anchor
+        # Each MLP takes [P_i, f^a] (concatenated eigenvector and anchor feature) and outputs augmented feature
+        if self.use_second_order:
+            self.mlp_feature_aug = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(feat_dim + feat_dim, feat_dim),  # [P_i expanded, f^a] -> feat_dim
+                    nn.ReLU(True),
+                    nn.Linear(feat_dim, feat_dim)
+                ).cuda() for _ in range(self.num_eigenvectors)
+            ])
+            # Augmented feature dimension for MLPs: original feat + M augmented features
+            aug_feat_dim = feat_dim * (1 + self.num_eigenvectors)
+        else:
+            self.mlp_feature_aug = None
+            aug_feat_dim = feat_dim
+
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+            nn.Linear(aug_feat_dim+3+self.opacity_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, n_offsets),
             nn.Tanh()
@@ -114,14 +142,14 @@ class GaussianModel:
         self.add_cov_dist = add_cov_dist
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
         self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+            nn.Linear(aug_feat_dim+3+self.cov_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 7*self.n_offsets),
         ).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(aug_feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
@@ -136,6 +164,9 @@ class GaussianModel:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
+        if self.use_second_order and self.mlp_feature_aug is not None:
+            for mlp in self.mlp_feature_aug:
+                mlp.eval()
 
     def train(self):
         self.mlp_opacity.train()
@@ -145,6 +176,9 @@ class GaussianModel:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
+        if self.use_second_order and self.mlp_feature_aug is not None:
+            for mlp in self.mlp_feature_aug:
+                mlp.train()
 
     def capture(self):
         return (
@@ -226,6 +260,88 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
+    # ============ SOGS: Second-Order Anchor Methods ============
+    
+    def compute_second_order_statistics(self):
+        """
+        Compute covariance-based second-order statistics from anchor features.
+        This extracts the top-M eigenvectors representing co-variation patterns
+        across anchor feature dimensions.
+        
+        Based on SOGS paper equations (4)-(9).
+        """
+        if not self.use_second_order:
+            return
+            
+        F_a = self._anchor_feat.detach()  # [N, D]
+        N, D = F_a.shape
+        
+        if N < 2:
+            # Not enough samples for covariance
+            self.top_eigenvectors = torch.eye(D, self.num_eigenvectors, device=F_a.device)
+            self._second_order_computed = True
+            return
+        
+        # Compute mean for centering (Eq. 5)
+        mu = F_a.mean(dim=0, keepdim=True)  # [1, D]
+        F_centered = F_a - mu  # [N, D]
+        
+        # Compute covariance matrix (Eq. 4)
+        # Σ = (1/(N-1)) * (F^a - μ^T)^T * (F^a - μ^T)
+        Sigma = (F_centered.T @ F_centered) / (N - 1)  # [D, D]
+        
+        # Compute standard deviations for correlation matrix (Eq. 6, 7)
+        std = torch.sqrt(torch.diag(Sigma) + 1e-8)  # [D]
+        
+        # Construct correlation matrix R (Eq. 6)
+        # R = A^(-1) * Σ * A^(-1) where A = diag(σ_1, ..., σ_D)
+        R = Sigma / (std.unsqueeze(0) * std.unsqueeze(1) + 1e-8)  # [D, D]
+        
+        # Eigendecomposition (Eq. 9)
+        # R = Q * Λ * Q^T
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(R)
+            # eigh returns eigenvalues in ascending order, we want descending
+            # Select top-M eigenvectors (largest eigenvalues)
+            self.top_eigenvectors = eigenvectors[:, -self.num_eigenvectors:].flip(dims=[1])  # [D, M]
+        except:
+            # Fallback if eigendecomposition fails
+            self.top_eigenvectors = torch.eye(D, self.num_eigenvectors, device=F_a.device)
+        
+        self._second_order_computed = True
+    
+    def get_augmented_features(self, feat, visible_mask=None):
+        """
+        Augment anchor features with second-order information (Eq. 10, 11).
+        
+        Args:
+            feat: Anchor features [N_visible, D]
+            visible_mask: Optional mask for visible anchors
+            
+        Returns:
+            Augmented features [N_visible, D * (1 + M)] where M is num_eigenvectors
+        """
+        if not self.use_second_order or self.top_eigenvectors is None:
+            return feat
+        
+        N, D = feat.shape
+        augmented_features = [feat]  # Start with original features
+        
+        # For each eigenvector P_i, compute augmented feature f_i^t (Eq. 10)
+        for i in range(self.num_eigenvectors):
+            P_i = self.top_eigenvectors[:, i:i+1].T  # [1, D]
+            P_i_expanded = P_i.expand(N, -1)  # [N, D]
+            
+            # Concatenate [P_i, f^a] and pass through MLP
+            combined = torch.cat([P_i_expanded, feat], dim=1)  # [N, 2D]
+            f_t = self.mlp_feature_aug[i](combined)  # [N, D]
+            augmented_features.append(f_t)
+        
+        # Concatenate all features (Eq. 11)
+        return torch.cat(augmented_features, dim=1)  # [N, D * (1 + M)]
+    
+    # ============ End SOGS Methods ============
+    
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
@@ -283,48 +399,29 @@ class GaussianModel:
 
         
         
+        # Base parameter list
+        l = [
+            {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
+            {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
+            {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
+            {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
+            {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+        ]
+        
+        # Add SOGS feature augmentation MLPs
+        if self.use_second_order and self.mlp_feature_aug is not None:
+            for i, mlp in enumerate(self.mlp_feature_aug):
+                l.append({'params': mlp.parameters(), 'lr': training_args.mlp_color_lr_init, "name": f"mlp_feature_aug_{i}"})
+        
         if self.use_feat_bank:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-                
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
-            ]
+            l.append({'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"})
+            l.append({'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"})
         elif self.appearance_dim > 0:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
-            ]
-        else:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-            ]
+            l.append({'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -384,6 +481,10 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            # SOGS: Learning rate for feature augmentation MLPs (use same schedule as mlp_color)
+            if self.use_second_order and param_group["name"].startswith("mlp_feature_aug"):
+                lr = self.mlp_color_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
@@ -736,19 +837,26 @@ class GaussianModel:
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))
+        
+        # Calculate augmented feature dimension for tracing
+        if self.use_second_order:
+            aug_feat_dim = self.feat_dim * (1 + self.num_eigenvectors)
+        else:
+            aug_feat_dim = self.feat_dim
+            
         if mode == 'split':
             self.mlp_opacity.eval()
-            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda()))
+            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, aug_feat_dim+3+self.opacity_dist_dim).cuda()))
             opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
             self.mlp_opacity.train()
 
             self.mlp_cov.eval()
-            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda()))
+            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, aug_feat_dim+3+self.cov_dist_dim).cuda()))
             cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
             self.mlp_cov.train()
 
             self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
+            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, aug_feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
@@ -763,29 +871,39 @@ class GaussianModel:
                 emd = torch.jit.trace(self.embedding_appearance, (torch.zeros((1,), dtype=torch.long).cuda()))
                 emd.save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
+            
+            # SOGS: Save feature augmentation MLPs
+            if self.use_second_order and self.mlp_feature_aug is not None:
+                for i, mlp in enumerate(self.mlp_feature_aug):
+                    mlp.eval()
+                    aug_mlp = torch.jit.trace(mlp, (torch.rand(1, 2*self.feat_dim).cuda()))
+                    aug_mlp.save(os.path.join(path, f'feature_aug_mlp_{i}.pt'))
+                    mlp.train()
+                # Save eigenvectors
+                if self.top_eigenvectors is not None:
+                    torch.save(self.top_eigenvectors, os.path.join(path, 'top_eigenvectors.pt'))
 
         elif mode == 'unite':
+            checkpoint_dict = {
+                'opacity_mlp': self.mlp_opacity.state_dict(),
+                'cov_mlp': self.mlp_cov.state_dict(),
+                'color_mlp': self.mlp_color.state_dict(),
+            }
+            
             if self.use_feat_bank:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
+                checkpoint_dict['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
+                checkpoint_dict['appearance'] = self.embedding_appearance.state_dict()
             elif self.appearance_dim > 0:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
-            else:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    }, os.path.join(path, 'checkpoints.pth'))
+                checkpoint_dict['appearance'] = self.embedding_appearance.state_dict()
+            
+            # SOGS: Save feature augmentation MLPs
+            if self.use_second_order and self.mlp_feature_aug is not None:
+                for i, mlp in enumerate(self.mlp_feature_aug):
+                    checkpoint_dict[f'feature_aug_mlp_{i}'] = mlp.state_dict()
+                if self.top_eigenvectors is not None:
+                    checkpoint_dict['top_eigenvectors'] = self.top_eigenvectors
+            
+            torch.save(checkpoint_dict, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
 
@@ -799,6 +917,18 @@ class GaussianModel:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
                 self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            
+            # SOGS: Load feature augmentation MLPs
+            if self.use_second_order:
+                for i in range(self.num_eigenvectors):
+                    mlp_path = os.path.join(path, f'feature_aug_mlp_{i}.pt')
+                    if os.path.exists(mlp_path):
+                        self.mlp_feature_aug[i] = torch.jit.load(mlp_path).cuda()
+                eigenvec_path = os.path.join(path, 'top_eigenvectors.pt')
+                if os.path.exists(eigenvec_path):
+                    self.top_eigenvectors = torch.load(eigenvec_path).cuda()
+                    self._second_order_computed = True
+                    
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
@@ -808,5 +938,14 @@ class GaussianModel:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:
                 self.embedding_appearance.load_state_dict(checkpoint['appearance'])
+            
+            # SOGS: Load feature augmentation MLPs
+            if self.use_second_order and self.mlp_feature_aug is not None:
+                for i in range(self.num_eigenvectors):
+                    if f'feature_aug_mlp_{i}' in checkpoint:
+                        self.mlp_feature_aug[i].load_state_dict(checkpoint[f'feature_aug_mlp_{i}'])
+                if 'top_eigenvectors' in checkpoint:
+                    self.top_eigenvectors = checkpoint['top_eigenvectors'].cuda()
+                    self._second_order_computed = True
         else:
             raise NotImplementedError
