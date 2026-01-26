@@ -8,6 +8,8 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# Modified for SOGS (Second-Order Gaussian Splatting)
+#
 import torch
 from einops import repeat
 
@@ -45,9 +47,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             feat[:,::1, :1]*bank_weight[:,:,2:]
         feat = feat.squeeze(dim=-1) # [n, c]
 
+    # SOGS: Augment features with second-order information
+    if pc.use_second_order and pc.top_eigenvectors is not None:
+        feat = pc.get_augmented_features(feat, visible_mask)
 
-    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1] or [N, c*(1+M)+3+1] for SOGS
+    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3] or [N, c*(1+M)+3] for SOGS
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
