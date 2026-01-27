@@ -76,6 +76,10 @@ class ModelParams(ParamGroup):
         self.add_cov_dist = False
         self.add_color_dist = False
         
+        # SOGS: Second-Order Anchor parameters
+        self.use_second_order = True  # Enable second-order anchor feature augmentation
+        self.num_eigenvectors = 2  # Number of eigenvectors (M in paper)
+        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -151,6 +155,9 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        
+        # SOGS: Selective gradient loss weight
+        self.lambda_sgl = 0.01
 
         super().__init__(parser, "Optimization Parameters")
 

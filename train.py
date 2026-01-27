@@ -21,6 +21,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 
 
 import torch
+import torch.nn.functional as F
 import torchvision
 import json
 import wandb
@@ -43,6 +44,65 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+
+# ============ SOGS: Selective Gradient Loss ============
+
+def selective_gradient_loss(rendered, gt):
+    """
+    Compute selective gradient loss as described in SOGS paper (Eq. 12-17).
+    
+    This loss focuses on difficult-to-render textures and structures by:
+    1. Computing gradient maps using Sobel operator
+    2. Weighting the loss by the rendering error map (dynamic region selection)
+    
+    Args:
+        rendered: Rendered image [C, H, W]
+        gt: Ground truth image [C, H, W]
+        
+    Returns:
+        Selective gradient loss scalar
+    """
+    # Define Sobel kernels (Eq. 13)
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                           dtype=torch.float32, device=rendered.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                           dtype=torch.float32, device=rendered.device).view(1, 1, 3, 3)
+    
+    # Convert to grayscale for gradient computation
+    # Using luminance weights: 0.299*R + 0.587*G + 0.114*B
+    weights = torch.tensor([0.299, 0.587, 0.114], device=rendered.device).view(1, 3, 1, 1)
+    
+    rendered_batch = rendered.unsqueeze(0)  # [1, C, H, W]
+    gt_batch = gt.unsqueeze(0)  # [1, C, H, W]
+    
+    rendered_gray = (rendered_batch * weights).sum(dim=1, keepdim=True)  # [1, 1, H, W]
+    gt_gray = (gt_batch * weights).sum(dim=1, keepdim=True)  # [1, 1, H, W]
+    
+    # Compute gradient maps (Eq. 12)
+    G_x_rendered = F.conv2d(rendered_gray, sobel_x, padding=1)
+    G_y_rendered = F.conv2d(rendered_gray, sobel_y, padding=1)
+    G_x_gt = F.conv2d(gt_gray, sobel_x, padding=1)
+    G_y_gt = F.conv2d(gt_gray, sobel_y, padding=1)
+    
+    # Compute gradient discrepancies (Eq. 14)
+    diff_x = G_x_rendered - G_x_gt
+    diff_y = G_y_rendered - G_y_gt
+    
+    l_x = torch.sqrt(diff_x ** 2 + 1e-8).mean()
+    l_y = torch.sqrt(diff_y ** 2 + 1e-8).mean()
+    
+    # Compute weight maps for dynamic region selection (Eq. 15)
+    w_x = torch.abs(diff_x)
+    w_y = torch.abs(diff_y)
+    
+    # Selective gradient loss (Eq. 16)
+    # Weight the loss by the error map to focus on difficult regions
+    loss = w_x.mean() * l_x + w_y.mean() * l_y
+    
+    return loss
+
+# ============ End SOGS ============
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -82,8 +142,19 @@ def saveRuntimeCode(dst: str) -> None:
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    
+    # SOGS: Add second-order anchor parameters
+    use_second_order = getattr(dataset, 'use_second_order', True)
+    num_eigenvectors = getattr(dataset, 'num_eigenvectors', 2)
+    lambda_sgl = getattr(opt, 'lambda_sgl', 0.01)  # Selective gradient loss weight
+    
+    gaussians = GaussianModel(
+        dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, 
+        dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, 
+        dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, 
+        dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
+        use_second_order=use_second_order, num_eigenvectors=num_eigenvectors
+    )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -97,6 +168,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    
+    # SOGS: Interval for updating second-order statistics
+    second_order_update_interval = 500
+    
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -117,6 +192,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        
+        # SOGS: Update second-order statistics periodically
+        if use_second_order and (iteration == 1 or iteration % second_order_update_interval == 0):
+            gaussians.compute_second_order_statistics()
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -142,7 +221,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        
+        # SOGS: Add selective gradient loss (Eq. 17)
+        if use_second_order:
+            sgl_loss = selective_gradient_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + lambda_sgl * sgl_loss
+        else:
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         loss.backward()
         
@@ -323,9 +408,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        # SOGS: Add second-order anchor parameters
+        use_second_order = getattr(dataset, 'use_second_order', True)
+        num_eigenvectors = getattr(dataset, 'num_eigenvectors', 2)
+        
+        gaussians = GaussianModel(
+            dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, 
+            dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, 
+            dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, 
+            dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
+            use_second_order=use_second_order, num_eigenvectors=num_eigenvectors
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        
+        # SOGS: Compute second-order statistics for rendering
+        if use_second_order:
+            gaussians.compute_second_order_statistics()
+        
         gaussians.eval()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]

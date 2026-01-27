@@ -1,240 +1,155 @@
-# Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
+# SOGS: Second-Order Gaussian Splatting
 
-[Tao Lu](https://github.com/inspirelt), [Mulin Yu](https://scholar.google.com/citations?user=w0Od3hQAAAAJ), [Linning Xu](https://eveneveno.github.io/lnxu), [Yuanbo Xiangli](https://kam1107.github.io/), [Limin Wang](https://wanglimin.github.io/), [Dahua Lin](http://dahua.site/), [Bo Dai](https://daibo.info/) <br />
-
-
-[[`Project Page`](https://city-super.github.io/scaffold-gs/)][[`arxiv`](https://arxiv.org/abs/2312.00109)][[`Viewer`](https://drive.google.com/file/d/17nPVnRRxO4zMQJ_fKHm13HzvD0wUZ8XF/view?usp=sharing)]
-
-## News
-
-**[2024.09.25]** 🎈We propose **Octree-AnyGS**, a general anchor-based framework that supports explicit Gaussians (2D-GS, 3D-GS) and neural Gaussians (Scaffold-GS). Additionally, **Octree-GS** has been adapted to the aforementioned Gaussian primitives, enabling Level-of-Detail representation for large-scale scenes. This framework holds potential for application to other Gaussian-based methods, with relevant SIBR visualizations forthcoming.(https://github.com/city-super/Octree-AnyGS)
-
-**[2024.05.28]**  We update the [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) to conform to the file structure at training.
-
-**[2024.04.05]**  Scaffold-GS is selected as a 🎈**highlight** in CVPR2024.
-
-**[2024.03.27]**  🎈We release [Octree-GS](https://city-super.github.io/octree-gs), supporting an explicit *LOD* representation, rendering faster in large-scale scene with high quality.
-
-**[2024.03.26]**  🎈We release [GSDF](https://city-super.github.io/GSDF/), which improves rendering and reconstruction quality simultaneously.
-
-**[2024.02.27]**  Accepted to [CVPR 2024](https://cvpr.thecvf.com/).
-
-**[2024.01.22]**  We add the appearance embedding to Scaffold-GS to handle wild scenes.
-
-**[2024.01.22]** 🎈👀 The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now. 
-
-**[2023.12.10]** We release the code.
-
-## TODO List
-- [ ] Explore on removing the MLP module
-- [ ] Improve the training configuration system
+Implementation of **Second-Order Anchor** for Scaffold-GS, based on the paper:
+> "SOGS: Second-Order Anchor for Advanced 3D Gaussian Splatting" (arXiv:2503.07476)
 
 ## Overview
 
-<p align="center">
-<img src="assets/pipeline.png" width=100% height=100% 
-class="center">
-</p>
+SOGS improves anchor-based 3D Gaussian Splatting by introducing:
+1. **Second-Order Anchors**: Uses covariance-based statistics to capture co-variation patterns across anchor feature dimensions
+2. **Selective Gradient Loss**: Focuses optimization on difficult-to-render textures and geometries
 
+This enables **superior rendering quality with reduced model size**
 
-We introduce Scaffold-GS, which uses anchor points to distribute local 3D Gaussians, and predicts their attributes on-the-fly based on viewing direction and distance within the view frustum.
+## Key Changes
 
-Our method performs superior on scenes with challenging observing views. e.g. transparency, specularity, reflection, texture-less regions and fine-scale details.
+### 1. New Parameters (`arguments/__init__.py`)
 
-<p align="center">
-<img src="assets/teaser_big.png" width=100% height=100% 
-class="center">
-</p>
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--use_second_order` | `True` | Enable second-order anchor feature augmentation |
+| `--num_eigenvectors` | `2` | Number of eigenvectors M for co-variation patterns |
+| `--lambda_sgl` | `0.01` | Weight for selective gradient loss |
 
+### 2. Second-Order Anchor (`scene/gaussian_model.py`)
 
+- **Feature Augmentation MLPs**: M additional MLPs that process eigenvector-guided features
+- **`compute_second_order_statistics()`**: Computes covariance matrix and extracts top-M eigenvectors
+- **`get_augmented_features()`**: Augments anchor features from dimension D to D×(1+M)
 
+### 3. Renderer Integration (`gaussian_renderer/__init__.py`)
 
+- Calls `get_augmented_features()` when SOGS is enabled
+- Feature dimension changes from `feat_dim` to `feat_dim × (1 + num_eigenvectors)`
 
-## Installation
+### 4. Selective Gradient Loss (`train.py`)
 
-We tested on a server configured with Ubuntu 18.04, cuda 11.6 and gcc 9.4.0. Other similar configurations should also work, but we have not verified each one individually.
+- Uses Sobel operators to compute gradient maps
+- Applies dynamic region selection to focus on high-error areas
+- Loss function: `L = λ₁·L₁ + λ_SSIM·L_SSIM + λ_vol·L_vol + λ_s·L_sgl`
 
-1. Clone this repo:
+## Usage
 
-```
-git clone https://github.com/city-super/Scaffold-GS.git --recursive
-cd Scaffold-GS
-```
+### Training with SOGS (Default)
 
-2. Install dependencies
+```bash
+# SOGS is enabled by default with feat_dim=32
+python train.py -s /path/to/dataset -m /path/to/output
 
-```
-SET DISTUTILS_USE_SDK=1 # Windows only
-conda env create --file environment.yml
-conda activate scaffold_gs
-```
-
-## Data
-
-First, create a ```data/``` folder inside the project path by 
-
-```
-mkdir data
-```
-
-The data structure will be organised as follows:
-
-```
-data/
-├── dataset_name
-│   ├── scene1/
-│   │   ├── images
-│   │   │   ├── IMG_0.jpg
-│   │   │   ├── IMG_1.jpg
-│   │   │   ├── ...
-│   │   ├── sparse/
-│   │       └──0/
-│   ├── scene2/
-│   │   ├── images
-│   │   │   ├── IMG_0.jpg
-│   │   │   ├── IMG_1.jpg
-│   │   │   ├── ...
-│   │   ├── sparse/
-│   │       └──0/
-...
+# Recommended: Use reduced feat_dim for memory savings
+python train.py -s /path/to/dataset -m /path/to/output --feat_dim 16
 ```
 
+### Training without SOGS (Original Scaffold-GS)
 
-### Public Data
-
-The BungeeNeRF dataset is available in [Google Drive](https://drive.google.com/file/d/1nBLcf9Jrr6sdxKa1Hbd47IArQQ_X8lww/view?usp=sharing)/[百度网盘[提取码:4whv]](https://pan.baidu.com/s/1AUYUJojhhICSKO2JrmOnCA). The MipNeRF360 scenes are provided by the paper author [here](https://jonbarron.info/mipnerf360/). And we test on scenes ```bicycle, bonsai, counter, garden, kitchen, room, stump```. The SfM data sets for Tanks&Temples and Deep Blending are hosted by 3D-Gaussian-Splatting [here](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip). Download and uncompress them into the ```data/``` folder.
-
-### Custom Data
-
-For custom data, you should process the image sequences with [Colmap](https://colmap.github.io/) to obtain the SfM points and camera poses. Then, place the results into ```data/``` folder.
-
-
-## Training
-
-### Training multiple scenes
-
-To train multiple scenes in parallel, we provide batch training scripts: 
-
- - Tanks&Temples: ```train_tnt.sh```
- - MipNeRF360: ```train_mip360.sh```
- - BungeeNeRF: ```train_bungee.sh```
- - Deep Blending: ```train_db.sh```
- - Nerf Synthetic: base ->```train_nerfsynthetic.sh```; with warmup->```train_nerfsynthetic_withwarmup.sh```
-
- run them with 
-
- ```
-bash train_xxx.sh
- ```
-
- > Notice 1: Make sure you have enough GPU cards and memories to run these scenes at the same time.
-
- > Notice 2: Each process occupies many cpu cores, which may slow down the training process. Set ```torch.set_num_threads(32)``` accordingly in the ```train.py``` to alleviate it.
-
-### Training a single scene
-
-For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
-
-```
-bash ./single_train.sh
+```bash
+# Disable SOGS explicitly
+python train.py -s /path/to/dataset -m /path/to/output --use_second_order False --feat_dim 32
 ```
 
-- scene: scene name with a format of ```dataset_name/scene_name/``` or ```scene_name/```;
-- exp_name: user-defined experiment name;
-- gpu: specify the GPU id to run the code. '-1' denotes using the most idle GPU. 
-- voxel_size: size for voxelizing the SfM points, smaller value denotes finer structure and higher overhead, '0' means using the median of each point's 1-NN distance as the voxel size.
-- update_init_factor: initial resolution for growing new anchors. A larger one will start placing new anchor in a coarser resolution.
+### Custom SOGS Configuration
 
-> For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script. 
-
-
-This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
-
-
-
-
-
-## Evaluation
-
-We've integrated the rendering and metrics calculation process into the training code. So, when completing training, the ```rendering results```, ```fps``` and ```quality metrics``` will be printed automatically. And the rendering results will be save in the log dir. Mind that the ```fps``` is roughly estimated by 
-
-```
-torch.cuda.synchronize();t_start=time.time()
-rendering...
-torch.cuda.synchronize();t_end=time.time()
+```bash
+# Use 3 eigenvectors with higher gradient loss weight
+python train.py -s /path/to/dataset -m /path/to/output \
+    --feat_dim 12 \
+    --num_eigenvectors 3 \
+    --lambda_sgl 0.02
 ```
 
-which may differ somewhat from the original 3D-GS, but it does not affect the analysis.
+## Testing the Implementation
 
-Meanwhile, we keep the manual rendering function with a similar usage of the counterpart in [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), one can run it by 
+Run the test script to verify SOGS is working correctly:
 
-```
-python render.py -m <path to trained model> # Generate renderings
-python metrics.py -m <path to trained model> # Compute error metrics on renderings
-```
-
-## Viewer
-
-The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now. 
-
-Recommended dataset structure in the source path location:
-
-```
-<location>
-|---sparse
-    |---0
-        |---cameras.bin
-        |---images.bin
-        |---points3D.bin
+```bash
+conda activate feature_3dgs2
+python test_sogs.py
 ```
 
-or
-
+Expected output:
 ```
-<location>
-|---points3D.ply
-|---transforms.json
-```
-
-Recommended checkpoint  structure in the model path location:
-
-```
-<location>
-|---point_cloud
-|   |---point_cloud.ply
-|   |---color_mlp.pt
-|   |---cov_mlp.pt
-|   |---opacity_mlp.pt
-(|   |---embedding_appearance.pt)
-|---cfg_args
-|---cameras.json
-(|---input.ply)
+✓ PASSED: Second-Order Statistics
+✓ PASSED: Selective Gradient Loss
+✓ PASSED: MLP Dimensions
+✓ PASSED: Memory Comparison
 ```
 
+## Memory Efficiency
 
-## Contact
+With 100,000 anchors:
 
-- Tao Lu: taolu@smail.nju.edu.cn
-- Mulin Yu: yumulin@pjlab.org.cn
+| Configuration | Feature Memory | Savings |
+|---------------|---------------|---------|
+| Scaffold-GS (feat_dim=32) | 12.21 MB | - |
+| SOGS (feat_dim=16, M=2) | 6.10 MB | **50%** |
+| SOGS (feat_dim=12, M=2) | 4.58 MB | **62.5%** |
+
+The overhead from eigenvectors and MLPs is negligible (~4 KB).
+
+## Mathematical Background
+
+### Second-Order Statistics (Equations 4-9)
+
+Given anchor features F^a ∈ R^(N×D):
+
+1. **Covariance Matrix**: Σ = (1/(N-1)) × (F^a - μ)^T × (F^a - μ)
+2. **Correlation Matrix**: R = A^(-1) × Σ × A^(-1) (standardized)
+3. **Eigendecomposition**: R = Q × Λ × Q^T
+4. **Select top-M eigenvectors**: P = [P₁, ..., P_M]
+
+### Feature Augmentation (Equation 10-11)
+
+For each anchor feature f^a:
+```
+f_i^t = MLP_i([P_i, f^a])  for i ∈ [1, M]
+output = concat([f^a, f_1^t, ..., f_M^t])
+```
+
+### Selective Gradient Loss (Equations 12-17)
+
+```
+G'_x = Sobel_x * I'    (rendered gradient)
+G_x  = Sobel_x * I     (ground truth gradient)
+w_x  = |G'_x - G_x|    (weight map)
+L_s  = w_x · l_x + w_y · l_y
+```
+
+## File Changes Summary
+
+```
+arguments/__init__.py      # +7 lines  (new parameters)
+scene/gaussian_model.py    # +204/-65  (second-order anchor)
+gaussian_renderer/__init__.py  # +7/-2 (feature augmentation)
+train.py                   # +104/-5  (selective gradient loss)
+test_sogs.py               # +280     (test script)
+```
 
 ## Citation
 
-If you find our work helpful, please consider citing:
+If you use this implementation, please cite both papers:
 
 ```bibtex
-@inproceedings{scaffoldgs,
-  title={Scaffold-gs: Structured 3d gaussians for view-adaptive rendering},
+@article{zhang2025sogs,
+  title={SOGS: Second-Order Anchor for Advanced 3D Gaussian Splatting},
+  author={Zhang, Jiahui and Zhan, Fangneng and Shao, Ling and Lu, Shijian},
+  journal={arXiv preprint arXiv:2503.07476},
+  year={2025}
+}
+
+@inproceedings{lu2024scaffold,
+  title={Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering},
   author={Lu, Tao and Yu, Mulin and Xu, Linning and Xiangli, Yuanbo and Wang, Limin and Lin, Dahua and Dai, Bo},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={20654--20664},
+  booktitle={CVPR},
   year={2024}
 }
 ```
-
-## LICENSE
-
-Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).
-
-## Acknowledgement
-
-We thank all authors from [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) for presenting such an excellent work.
