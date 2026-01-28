@@ -17,7 +17,7 @@ This enables **superior rendering quality with reduced model size**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--use_second_order` | `True` | Enable second-order anchor feature augmentation |
+| `--no_second_order` | `True` | Enable no second-order anchor feature augmentation |
 | `--num_eigenvectors` | `2` | Number of eigenvectors M for co-variation patterns |
 | `--lambda_sgl` | `0.01` | Weight for selective gradient loss |
 
@@ -54,7 +54,7 @@ python train.py -s /path/to/dataset -m /path/to/output --feat_dim 16
 
 ```bash
 # Disable SOGS explicitly
-python train.py -s /path/to/dataset -m /path/to/output --use_second_order False --feat_dim 32
+python train.py -s /path/to/dataset -m /path/to/output --no_second_order --feat_dim 32
 ```
 
 ### Custom SOGS Configuration
