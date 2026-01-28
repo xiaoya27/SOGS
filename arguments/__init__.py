@@ -81,10 +81,17 @@ class ModelParams(ParamGroup):
         self.num_eigenvectors = 2  # Number of eigenvectors (M in paper)
         
         super().__init__(parser, "Loading Parameters", sentinel)
-
+        
+        # Add explicit --no_second_order flag to disable SOGS
+        parser.add_argument("--no_second_order", action="store_true", default=False,
+                            help="Disable second-order anchor feature augmentation (use original Scaffold-GS)")
+    
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        # Handle --no_second_order flag
+        if hasattr(args, 'no_second_order') and args.no_second_order:
+            g.use_second_order = False
         return g
 
 class PipelineParams(ParamGroup):
