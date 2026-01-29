@@ -1,6 +1,6 @@
 # SOGS: Second-Order Gaussian Splatting
 
-Implementation of **Second-Order Anchor** for Scaffold-GS, based on the paper:
+Unofficial implementation of **Second-Order Anchor** for Scaffold-GS, based on the paper:
 > "SOGS: Second-Order Anchor for Advanced 3D Gaussian Splatting" (arXiv:2503.07476)
 
 ## Overview
